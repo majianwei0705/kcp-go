@@ -606,8 +606,8 @@ func (s *UDPSession) update() {
 
 		if s.enableKeepalive {
 			if now.Unix() > s.kcp.last_heartbeat+s.keepaliveIdle {
-				_ = s.Close()
 				s.mu.Unlock()
+				_ = s.Close()
 				return
 			}
 
