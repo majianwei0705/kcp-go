@@ -141,14 +141,18 @@ type KCP struct {
 	nodelay, updated                       uint32
 	ts_probe, probe_wait                   uint32
 	dead_link, incr                        uint32
+	enable_heartbeat                       bool
+	last_heartbeat                         int64
 
 	fastresend     int32
 	nocwnd, stream int32
 
-	snd_queue []segment
-	rcv_queue []segment
-	snd_buf   []segment
-	rcv_buf   []segment
+	snd_queue        []segment
+	rcv_queue        []segment
+	keep_alive_queue []segment
+
+	snd_buf []segment
+	rcv_buf []segment
 
 	acklist []ackItem
 
@@ -183,7 +187,24 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.ssthresh = IKCP_THRESH_INIT
 	kcp.dead_link = IKCP_DEADLINK
 	kcp.output = output
+	kcp.enable_heartbeat = false
+	kcp.last_heartbeat = time.Now().Unix()
+
 	return kcp
+}
+
+type KcpSnapshot struct {
+	Snd_wnd, Rcv_wnd, Rmt_wnd, Probe uint32
+}
+
+func (kcp *KCP) GetStatistics() *KcpSnapshot {
+
+	return &KcpSnapshot{
+		Snd_wnd: kcp.snd_wnd,
+		Rcv_wnd: kcp.rcv_wnd,
+		Rmt_wnd: kcp.rmt_wnd,
+		Probe:   kcp.probe,
+	}
 }
 
 // newSegment creates a KCP segment
@@ -368,6 +389,13 @@ func (kcp *KCP) Send(buffer []byte) int {
 		buffer = buffer[size:]
 	}
 	return 0
+}
+
+func (kcp *KCP) SendKeepAlive() {
+	if len(kcp.keep_alive_queue) != 0 {
+		return
+	}
+	kcp.keep_alive_queue = append(kcp.keep_alive_queue, kcp.newSegment(0))
 }
 
 func (kcp *KCP) update_ack(rtt int32) {
@@ -659,6 +687,11 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	} else if ackNoDelay && len(kcp.acklist) > 0 { // ack immediately
 		kcp.flush(true)
 	}
+
+	if inSegs != 0 && kcp.enable_heartbeat {
+		kcp.last_heartbeat = time.Now().Unix()
+	}
+
 	return 0
 }
 
@@ -773,8 +806,23 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		kcp.snd_nxt++
 		newSegsCount++
 	}
+
 	if newSegsCount > 0 {
 		kcp.snd_queue = kcp.remove_front(kcp.snd_queue, newSegsCount)
+	}
+
+	// 心跳包
+	if len(kcp.keep_alive_queue) != 0 {
+		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) < 0 {
+			newseg := kcp.keep_alive_queue[0]
+
+			kcp.keep_alive_queue = nil
+			newseg.conv = kcp.conv
+			newseg.cmd = IKCP_CMD_PUSH
+			newseg.sn = kcp.snd_nxt
+			kcp.snd_buf = append(kcp.snd_buf, newseg)
+			kcp.snd_nxt++
+		}
 	}
 
 	// calculate resent

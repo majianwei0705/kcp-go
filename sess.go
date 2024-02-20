@@ -107,6 +107,11 @@ type (
 		xconnWriteError error
 
 		mu sync.Mutex
+
+		enableKeepalive   bool
+		keepaliveInterval int64
+		keepaliveIdle     int64
+		lastSendKeepalive int64
 	}
 
 	setReadBuffer interface {
@@ -181,8 +186,14 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		atomic.AddUint64(&DefaultSnmp.PassiveOpens, 1)
 	}
 
+	now := time.Now()
+	sess.enableKeepalive = false
+	sess.keepaliveInterval = 5
+	sess.keepaliveIdle = 10
+	sess.lastSendKeepalive = now.Unix()
+
 	// start per-session updater
-	SystemTimedSched.Put(sess.update, time.Now())
+	SystemTimedSched.Put(sess.update, now)
 
 	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
@@ -191,6 +202,18 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	}
 
 	return sess
+}
+
+func (s *UDPSession) GetKcp() *KCP {
+	return s.kcp
+}
+
+// 心跳相关
+func (s *UDPSession) EnableKeepalive(enable bool, intervalSecond, idleSecond int64) {
+	s.enableKeepalive = enable
+	s.keepaliveInterval = intervalSecond
+	s.keepaliveIdle = idleSecond
+	s.kcp.enable_heartbeat = enable
 }
 
 // Read implements net.Conn
@@ -251,6 +274,10 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		}
 	}
+}
+
+func (s *UDPSession) GetStatistics() uint32 {
+	return s.kcp.conv
 }
 
 // Write implements net.Conn
@@ -573,7 +600,23 @@ func (s *UDPSession) update() {
 	select {
 	case <-s.die:
 	default:
+		now := time.Now()
+
 		s.mu.Lock()
+
+		if s.enableKeepalive {
+			if now.Unix() > s.kcp.last_heartbeat+s.keepaliveIdle {
+				_ = s.Close()
+				s.mu.Unlock()
+				return
+			}
+
+			if s.ownConn && (now.Unix() > s.kcp.last_heartbeat+s.keepaliveInterval) && (now.Unix() > s.lastSendKeepalive+s.keepaliveInterval) {
+				s.kcp.SendKeepAlive()
+				s.lastSendKeepalive = now.Unix()
+			}
+		}
+
 		interval := s.kcp.flush(false)
 		waitsnd := s.kcp.WaitSnd()
 		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
@@ -582,7 +625,7 @@ func (s *UDPSession) update() {
 		s.uncork()
 		s.mu.Unlock()
 		// self-synchronized timed scheduling
-		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
+		SystemTimedSched.Put(s.update, now.Add(time.Duration(interval)*time.Millisecond))
 	}
 }
 
